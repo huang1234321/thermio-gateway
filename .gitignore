@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# 环境与凭据（SEC-KEY-06：.env 不入库，.env.example 占位）
+.env
+*.env.local
+
+# 本地产物
+*.db
+*.db-wal
+*.db-shm
+discovery-*.json
+export-*.xlsx
+logs/
