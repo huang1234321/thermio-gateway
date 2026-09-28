@@ -12,7 +12,10 @@
 - 换算失败/点不在 pointmap → 容错跳过 + 本地 ERROR 日志（事后可查；
   云端 M2 dry-run 的 offline_action_ref_unresolved 警告是第一道防线）；
 - **重连不自动回写原值**：恢复秩序归云端（ADR-009 租约回滚/人工指令）；
-- ARMED 后回到 LINK_UP 需先经历一次重连（单次触发语义）。
+- ARMED 后回到 LINK_UP 需先经历一次重连（单次触发语义）；
+- **写毕去向按当前连接态收敛**（在途交错防御）：写在途窗内重连 →
+  LINK_UP（新一轮断链可再触发）；写毕时仍断链（含写过程中再断链）→
+  ARMED + 闩锁——「单次触发」约束的是单次断网期，闩随重连复位。
 """
 
 from __future__ import annotations
@@ -64,6 +67,7 @@ class OfflineActionExecutor:
         self._state = STATE_LINK_UP
         self._timer_task: asyncio.Task | None = None
         self._armed_latch = False  # ARMED 单次触发：断网期内只写一遍
+        self._mqtt_connected = False  # 连接态镜像（连接事件驱动，写毕去向判定）
 
     def bind(
         self,
@@ -86,6 +90,7 @@ class OfflineActionExecutor:
     # ── 连接事件驱动 ───────────────────────────────────────────────────────
 
     def on_mqtt_disconnected(self) -> None:
+        self._mqtt_connected = False
         if self._state != STATE_LINK_UP or self._timer_task is not None:
             return
         log.warning("MQTT 断链，GRACE %ss（重连即取消）", self._delay_s)
@@ -93,11 +98,15 @@ class OfflineActionExecutor:
         self._timer_task = asyncio.create_task(self._grace_then_write())
 
     def on_mqtt_connected(self) -> None:
+        self._mqtt_connected = True
         if self._timer_task is not None:
             self._timer_task.cancel()
             self._timer_task = None
             log.info("GRACE 期内重连，安全值触发取消")
-        # ARMED → LINK_UP（重连不自动回写原值，§7.4：恢复秩序归云端）
+        # ARMED → LINK_UP（重连不自动回写原值，§7.4：恢复秩序归云端）。
+        # 闩随重连复位：「单次触发」约束的是单次断网期，新断链是新一轮——
+        # 否则安全网在一次触发后静默失效（同缺陷族的收敛点）。
+        self._armed_latch = False
         self._state = STATE_LINK_UP
 
     async def _grace_then_write(self) -> None:
@@ -107,19 +116,33 @@ class OfflineActionExecutor:
             return
         self._timer_task = None
         if self._action is None or not self._action.writes:
-            self._state = STATE_ARMED  # 无配置也置 ARMED（单次触发语义）
-            log.info("offline_action 无安全值清单，直接 ARMED")
+            self._settle_after_write("offline_action 无安全值清单，本轮视同已触发")
             return
-        if self._armed_latch:
-            self._state = STATE_ARMED
+        if self._armed_latch:  # 防御分支：重连复位闩后正常不可达
+            self._settle_after_write("安全值已写过（闩锁），本轮不再写")
             return
         self._state = STATE_SAFE_WRITE
         log.warning("GRACE 到期，按序写安全值（%d 项）", len(self._action.writes))
         for w in self._action.writes:
             await self._write_safe_value(w.raw_name, w.value)
-        self._armed_latch = True
-        self._state = STATE_ARMED
-        log.warning("安全值写毕，ARMED（断网期间不再反复写；重连不自动回写）")
+        self._settle_after_write("安全值写毕，ARMED（断网期间不再反复写；重连不自动回写）")
+
+    def _settle_after_write(self, armed_msg: str) -> None:
+        """写毕去向按**当前连接态**收敛（在途交错防御，评审修单案 A）：
+
+        - 已重连（写在途窗内恢复）→ LINK_UP：在线常态；闩保持复位——
+          下次真实断链走完整 GRACE→安全值链路（不被 ARMED 盖掉）；
+        - 仍断链（含写过程中再断链）→ ARMED + 闩锁：单次触发语义不变，
+          重连后复位。
+        """
+        if self._mqtt_connected:
+            self._armed_latch = False
+            self._state = STATE_LINK_UP
+            log.warning("安全值路径收敛：写在途窗内已重连 → LINK_UP（新一轮断链可再触发）")
+        else:
+            self._armed_latch = True
+            self._state = STATE_ARMED
+            log.warning(armed_msg)
 
     async def _write_safe_value(self, raw_name: str, value_std: float) -> None:
         point = self._get_point(raw_name)
